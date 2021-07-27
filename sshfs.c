@@ -126,8 +126,6 @@
 
 #define MY_EOF 1
 
-#define MAX_REPLY_LEN (1 << 17)
-
 #define RENAME_TEMP_CHARS 8
 
 #define SFTP_SERVER_PATH "/usr/lib/sftp-server"
@@ -1386,10 +1384,6 @@ static int sftp_read(struct conn *conn, uint8_t *type, struct buffer *buf)
 	if (res != -1) {
 		if (buf_get_uint32(&buf2, &len) == -1)
 			return -1;
-		if (len > MAX_REPLY_LEN) {
-			fprintf(stderr, "reply len too large: %u\n", len);
-			return -1;
-		}
 		if (buf_get_uint8(&buf2, type) == -1)
 			return -1;
 		buf_init(buf, len - 1);
@@ -1577,7 +1571,7 @@ static int sftp_init_reply_ok(struct conn *conn, struct buffer *buf,
 	if (buf_get_uint32(buf, &len) == -1)
 		return -1;
 
-	if (len < 5 || len > MAX_REPLY_LEN)
+	if (len < 5)
 		return 1;
 
 	if (buf_get_uint8(buf, &type) == -1)
