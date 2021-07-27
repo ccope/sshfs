@@ -135,6 +135,7 @@
 #define READDIR_MAX 32
 
 #define MAX_PASSWORD 1024
+#define MAX_SFTP_MESSAGE_SIZE 2096128 // 2047*1024
 
 /*
    Handling of multiple SFTP connections
@@ -4334,10 +4335,11 @@ int main(int argc, char *argv[])
 
 	sshfs.randseed = time(0);
 
-	if (sshfs.max_read > 65536)
-		sshfs.max_read = 65536;
-	if (sshfs.max_write > 65536)
-		sshfs.max_write = 65536;
+        // TODO: Don't silently change limits
+	if (sshfs.max_read > MAX_SFTP_MESSAGE_SIZE)
+		sshfs.max_read = MAX_SFTP_MESSAGE_SIZE;
+	if (sshfs.max_write > MAX_SFTP_MESSAGE_SIZE)
+		sshfs.max_write = MAX_SFTP_MESSAGE_SIZE;
 
 	fsname = fsname_escape_commas(fsname);
 	tmp = g_strdup_printf("-osubtype=sshfs,fsname=%s", fsname);
