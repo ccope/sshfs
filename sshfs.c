@@ -45,6 +45,7 @@
 #include <pwd.h>
 #include <grp.h>
 #include <limits.h>
+#include <stdbool.h>
 #ifdef __APPLE__
 #  include <strings.h>
 #  include <libgen.h>
@@ -121,6 +122,7 @@
 #define SFTP_EXT_STATVFS "statvfs@openssh.com"
 #define SFTP_EXT_HARDLINK "hardlink@openssh.com"
 #define SFTP_EXT_FSYNC "fsync@openssh.com"
+#define SFTP_EXT_LIMITS "limits@openssh.com"
 
 #define PROTO_VERSION 3
 
@@ -135,7 +137,8 @@
 #define READDIR_MAX 32
 
 #define MAX_PASSWORD 1024
-#define MAX_SFTP_MESSAGE_SIZE 2096128 // 2047*1024
+#define DEFAULT_MAX_SFTP_MSG_LIMIT 65536
+#define DEFAULT_MIN_SFTP_MSG_LIMIT 32768
 
 /*
    Handling of multiple SFTP connections
@@ -254,6 +257,13 @@ struct request {
 	size_t len;
 	struct list_head list;
 	struct conn *conn;
+};
+
+struct sftp_limits {
+        uint64_t packet_length;
+        uint64_t read_length;
+        uint64_t write_length;
+        uint64_t open_handles;
 };
 
 struct sshfs_io {
@@ -595,6 +605,9 @@ static const char *type_name(uint8_t type)
 	default:                     return "???";
 	}
 }
+
+static int sftp_request(struct conn *conn, uint8_t type, const struct buffer *buf,
+			uint8_t expect_type, struct buffer *outbuf);
 
 #define container_of(ptr, type, member) ({				\
 			const typeof( ((type *)0)->member ) *__mptr = (ptr); \
@@ -1565,6 +1578,99 @@ static void *process_requests(void *data_)
 	return NULL;
 }
 
+static void apply_naive_sftp_limits() {
+	// OpenSSH SFTP server < v8.6p1 limit is 65536 bytes
+	/* if no server limits feature:
+	 *  [x] if user limit, cap to 64k
+	 *  [x] warn if value is >64k
+	 *  [x] default to 32k
+	 */
+        // TODO: Allow override?
+	bool warn = false;
+	if (sshfs.max_read > DEFAULT_MAX_SFTP_MSG_LIMIT) {
+		sshfs.max_read = DEFAULT_MAX_SFTP_MSG_LIMIT;
+		warn = true;
+	} else if (sshfs.max_read == 0) {
+		sshfs.max_read = DEFAULT_MIN_SFTP_MSG_LIMIT;
+	}
+
+	if (sshfs.max_write > DEFAULT_MAX_SFTP_MSG_LIMIT) {
+		sshfs.max_write = DEFAULT_MAX_SFTP_MSG_LIMIT;
+		warn = true;
+	} else if (sshfs.max_write == 0) {
+		sshfs.max_write = DEFAULT_MIN_SFTP_MSG_LIMIT;
+	}
+
+	if (warn) {
+		fprintf(stderr, "OpenSSH SFTP server read/write limit is 64KB\n");
+	}
+}
+
+/* If server has limits feature:
+ *  * if server limit is 0:
+ *    [x] if user limit, set to user limit
+ *    [x] otherwise default to 1MB
+ *  * if server limit > 0:
+ *    [x] if user limit less than server limit, use user limit
+ *      [ ] warn?
+ *    [x] if user limit > server limit, use server limit
+ *      [ ] warn
+ *    [x] else use server limit
+ *
+ */
+static void apply_sftp_limits(struct sftp_limits *limits) {
+	if (limits->read_length == 0) {
+		if (sshfs.max_read == 0) {
+			// TODO: Pick a bigger number, maybe dynamically somehow?
+			sshfs.max_read = 1048576;
+		}
+		// else sshfs.max_read already has a value
+	} else if (limits->read_length > 0) {
+		if (sshfs.max_read == 0 || sshfs.max_read > limits->read_length) {
+			sshfs.max_read = limits->read_length;
+		}
+	}
+
+	if (limits->write_length == 0) {
+		if (sshfs.max_write == 0) {
+			// TODO: Pick a bigger number, maybe dynamically somehow?
+			sshfs.max_write = DEFAULT_MAX_SFTP_MSG_LIMIT * 8;
+		}
+		// else sshfs.max_write already has a value
+	} else if (limits->write_length > 0) {
+		if (sshfs.max_write == 0 || sshfs.max_write > limits->write_length) {
+			sshfs.max_write = limits->write_length;
+		}
+	}
+}
+
+static int sftp_init_limits(struct conn *conn) {
+	int res;
+	struct buffer buf, outbuf;
+	struct sftp_limits limits;
+	memset(&limits, 0, sizeof(limits));
+	buf_init(&buf, 0);
+	buf_add_string(&buf, SFTP_EXT_LIMITS);
+	res = sftp_request(conn, SSH_FXP_EXTENDED, &buf, SSH_FXP_EXTENDED_REPLY, &outbuf);
+	buf_free(&buf);
+	if (res != 0) {
+		return res;
+	}
+        DEBUG("Received limits reply\n", NULL);
+
+        if ((res = buf_get_uint64(&outbuf, &limits.packet_length)) != 0 ||
+            (res = buf_get_uint64(&outbuf, &limits.read_length)) != 0 ||
+            (res = buf_get_uint64(&outbuf, &limits.write_length)) != 0 ||
+            (res = buf_get_uint64(&outbuf, &limits.open_handles)) != 0) {
+		buf_free(&outbuf);
+		return res;
+	}
+	DEBUG("Parsed limits reply:\nread: %u write: %u\n", NULL);
+	apply_sftp_limits(&limits);
+	return 0;
+
+}
+
 static int sftp_init_reply_ok(struct conn *conn, struct buffer *buf,
                               uint32_t *version)
 {
@@ -1588,6 +1694,7 @@ static int sftp_init_reply_ok(struct conn *conn, struct buffer *buf,
 
 	DEBUG("Server version: %u\n", *version);
 
+	bool limits_set = false;
 	if (len > 5) {
 		struct buffer buf2;
 
@@ -1626,10 +1733,22 @@ static int sftp_init_reply_ok(struct conn *conn, struct buffer *buf,
 			    strcmp(extdata, "1") == 0)
 				sshfs.ext_fsync = 1;
 
+			// Query the server for its limits
+			if (strcmp(ext, SFTP_EXT_LIMITS) == 0 &&
+			    strcmp(extdata, "1") == 0) {
+				if (sftp_init_limits(conn) != 0) {
+					fprintf(stderr, "handling server-side limits failed\n");
+					abort();
+				}
+				limits_set = true;
+			}
 			free(ext);
 			free(extdata);
 		} while (buf2.len < buf2.size);
 		buf_free(&buf2);
+	}
+	if (!limits_set) {
+		apply_naive_sftp_limits();
 	}
 	return 0;
 }
@@ -4170,9 +4289,6 @@ int main(int argc, char *argv[])
 #else
 	sshfs.blksize = 4096;
 #endif
-	/* SFTP spec says all servers should allow at least 32k I/O */
-	sshfs.max_read = 32768;
-	sshfs.max_write = 32768;
 #ifdef __APPLE__
 	sshfs.rename_workaround = 1;
 #else
@@ -4339,14 +4455,6 @@ int main(int argc, char *argv[])
 		exit(1);
 
 	sshfs.randseed = time(0);
-
-        // TODO: Don't silently change limits
-	if (sshfs.max_read > MAX_SFTP_MESSAGE_SIZE)
-		sshfs.max_read = MAX_SFTP_MESSAGE_SIZE;
-	if (sshfs.max_readahead > MAX_SFTP_MESSAGE_SIZE)
-		sshfs.max_readahead = MAX_SFTP_MESSAGE_SIZE;
-	if (sshfs.max_write > MAX_SFTP_MESSAGE_SIZE)
-		sshfs.max_write = MAX_SFTP_MESSAGE_SIZE;
 
 	fsname = fsname_escape_commas(fsname);
 	tmp = g_strdup_printf("-osubtype=sshfs,fsname=%s", fsname);
