@@ -223,6 +223,7 @@ struct conn {
 	int req_count;
 	int dir_count;
 	int file_count;
+	int initializing;
 };
 
 struct buffer {
@@ -608,7 +609,7 @@ static const char *type_name(uint8_t type)
 	}
 }
 
-static int sftp_request_sync(struct conn *conn, uint8_t type, const struct buffer *buf,
+static int sftp_request(struct conn *conn, uint8_t type, const struct buffer *buf,
 			uint8_t expect_type, struct buffer *outbuf);
 
 #define container_of(ptr, type, member) ({				\
@@ -1594,6 +1595,7 @@ static void close_conn(struct conn *conn)
 		close(sshfs.ptypassivefd);
 		sshfs.ptypassivefd = -1;
 	}
+	conn->initializing = 0;
 }
 
 static void *process_requests(void *data_)
@@ -1687,7 +1689,7 @@ static int sftp_init_limits(struct conn *conn) {
 	memset(&limits, 0, sizeof(limits));
 	buf_init(&buf, 0);
 	buf_add_string(&buf, SFTP_EXT_LIMITS);
-	err = sftp_request_sync(conn, SSH_FXP_EXTENDED, &buf, SSH_FXP_EXTENDED_REPLY, &outbuf);
+	err = sftp_request(conn, SSH_FXP_EXTENDED, &buf, SSH_FXP_EXTENDED_REPLY, &outbuf);
 	if (err != 0) {
 		goto out;
 	}
@@ -1815,6 +1817,7 @@ static int sftp_init(struct conn *conn)
 	uint32_t version = 0;
 	struct buffer buf;
 	buf_init(&buf, 0);
+	conn->initializing = 1;
 	if (sftp_send_iov(conn, SSH_FXP_INIT, PROTO_VERSION, NULL, 0) == -1)
 		goto out;
 
@@ -1840,9 +1843,19 @@ static int sftp_init(struct conn *conn)
 		apply_naive_sftp_limits();
 	}
 
+	if (sshfs.detect_uid) {
+		sftp_detect_uid(conn);
+		sshfs.detect_uid = 0;
+	}
+
+	if (!sshfs.no_check_root &&
+	    (res = sftp_check_root(conn, sshfs.base_path)) != 0)
+		goto out;
+
 	res = 0;
 
 out:
+	conn->initializing = 0;
 	buf_free(&buf);
 	return res;
 }
@@ -1870,7 +1883,7 @@ static void sftp_detect_uid(struct conn *conn)
 
 	buf_init(&buf, 5);
 	buf_add_string(&buf, ".");
-	if (sftp_request_sync(conn, SSH_FXP_STAT, &buf, SSH_FXP_ATTRS, &outbuf) == -1)
+	if (sftp_request(conn, SSH_FXP_STAT, &buf, SSH_FXP_ATTRS, &outbuf) == -1)
 		goto out;
 	if (buf_get_attrs(&outbuf, &st, &flags) != 0)
 		goto out;
@@ -1902,7 +1915,7 @@ static int sftp_check_root(struct conn *conn, const char *base_path)
 
 	buf_init(&buf, 0);
 	buf_add_string(&buf, remote_dir);
-	if (sftp_request_sync(conn, SSH_FXP_LSTAT, &buf, SSH_FXP_ATTRS, &outbuf) == -1)
+	if (sftp_request(conn, SSH_FXP_LSTAT, &buf, SSH_FXP_ATTRS, &outbuf) == -1)
 		goto out;
 	err = buf_get_attrs(&outbuf, &st, &flags);
 	if (err) {
@@ -1963,11 +1976,6 @@ static int start_processing_thread(struct conn *conn)
 			return -EIO;
 	}
 
-	if (sshfs.detect_uid) {
-		sftp_detect_uid(conn);
-		sshfs.detect_uid = 0;
-	}
-
 	sigemptyset(&newset);
 	sigaddset(&newset, SIGTERM);
 	sigaddset(&newset, SIGINT);
@@ -2008,14 +2016,14 @@ static void *sshfs_init(struct fuse_conn_info *conn,
 	// SFTP only supports 1-second time resolution
 	conn->time_gran = 1000000000;
 
+	// TODO: Should this be based upon max_read?
 	if (sshfs.max_readahead > 0)
 		conn->max_readahead = sshfs.max_readahead;
-	
+
 	return NULL;
 }
 
-// TODO: ORIGINAL SHOULD BE CONFIGURABLE WITH A THREADED FLAG
-static int sftp_request_wait_sync(struct conn *conn, struct request *req, uint8_t type,
+static int sftp_request_wait(struct request *req, uint8_t type,
                              uint8_t expect_type, struct buffer *outbuf)
 {
 	int err;
@@ -2024,10 +2032,7 @@ static int sftp_request_wait_sync(struct conn *conn, struct request *req, uint8_
 		err = req->error;
 		goto out;
 	}
-	err = sftp_request_process_sync(conn, req, type);
-	if (err != 0) {
-		goto out;
-	}
+	while (sem_wait(&req->ready));
 	if (req->error) {
 		err = req->error;
 		goto out;
@@ -2075,71 +2080,21 @@ static int sftp_request_wait_sync(struct conn *conn, struct request *req, uint8_
 	}
 
 out:
-	request_free(req);
-	return err;
-}
-
-static int sftp_request_wait(struct request *req, uint8_t type,
-                             uint8_t expect_type, struct buffer *outbuf)
-{
-	int err;
-
-	if (req->error) {
-		err = req->error;
-		goto out;
-	}
-	while (sem_wait(&req->ready));
-	if (req->error) {
-		err = req->error;
-		goto out;
-	}
-	err = -EIO;
-	if (req->reply_type != expect_type &&
-	    req->reply_type != SSH_FXP_STATUS) {
-		fprintf(stderr, "protocol error\n");
-		goto out;
-	}
-	if (req->reply_type == SSH_FXP_STATUS) {
-		uint32_t serr;
-		if (buf_get_uint32(&req->reply, &serr) == -1)
-			goto out;
-
-		switch (serr) {
-		case SSH_FX_OK:
-			if (expect_type == SSH_FXP_STATUS)
-				err = 0;
-			else
-				err = -EIO;
-			break;
-
-		case SSH_FX_EOF:
-			if (type == SSH_FXP_READ || type == SSH_FXP_READDIR)
-				err = MY_EOF;
-			else
-				err = -EIO;
-			break;
-
-		case SSH_FX_FAILURE:
-			if (type == SSH_FXP_RMDIR)
-				err = -ENOTEMPTY;
-			else
-				err = -EPERM;
-			break;
-
-		default:
-			err = -sftp_error_to_errno(serr);
-		}
-	} else {
-		buf_init(outbuf, req->reply.size - req->reply.len);
-		buf_get_mem(&req->reply, outbuf->p, outbuf->size);
-		err = 0;
-	}
-
-out:
 	pthread_mutex_lock(&sshfs.lock);
 	request_free(req);
 	pthread_mutex_unlock(&sshfs.lock);
 	return err;
+}
+
+static int sftp_request_wait_sync(struct conn *conn, struct request *req, uint8_t type,
+                             uint8_t expect_type, struct buffer *outbuf)
+{
+	int err;
+	err = sftp_request_process_sync(conn, req, type);
+	if (err != 0) {
+		return err;
+	}
+	return sftp_request_wait(req, type, expect_type, outbuf);
 }
 
 static int sftp_request_send_sync(struct conn *conn, uint8_t type, struct iovec *iov,
@@ -2258,41 +2213,25 @@ out:
 	return err;
 }
 
-static int sftp_request_iov_sync(struct conn *conn, uint8_t type, struct iovec *iov,
-			    size_t count, uint8_t expect_type, struct buffer *outbuf)
-{
-	int err;
-	struct request *req;
-
-	err = sftp_request_send_sync(conn, type, iov, count, NULL, NULL,
-				expect_type, NULL, &req);
-	if (expect_type == 0)
-		return err;
-
-	return sftp_request_wait_sync(conn, req, type, expect_type, outbuf);
-}
-
 static int sftp_request_iov(struct conn *conn, uint8_t type, struct iovec *iov,
 			    size_t count, uint8_t expect_type, struct buffer *outbuf)
 {
 	int err;
 	struct request *req;
 
-	err = sftp_request_send(conn, type, iov, count, NULL, NULL,
-				expect_type, NULL, &req);
-	if (expect_type == 0)
-		return err;
-
-	return sftp_request_wait(req, type, expect_type, outbuf);
-}
-
-static int sftp_request_sync(struct conn *conn, uint8_t type, const struct buffer *buf,
-			uint8_t expect_type, struct buffer *outbuf)
-{
-	struct iovec iov;
-
-	buf_to_iov(buf, &iov);
-	return sftp_request_iov_sync(conn, type, &iov, 1, expect_type, outbuf);
+	if (conn->initializing) {
+		err = sftp_request_send_sync(conn, type, iov, count, NULL, NULL,
+					expect_type, NULL, &req);
+		if (expect_type == 0)
+			return err;
+		return sftp_request_wait_sync(conn, req, type, expect_type, outbuf);
+	} else {
+		err = sftp_request_send(conn, type, iov, count, NULL, NULL,
+					expect_type, NULL, &req);
+		if (expect_type == 0)
+			return err;
+		return sftp_request_wait(req, type, expect_type, outbuf);
+	}
 }
 
 static int sftp_request(struct conn *conn, uint8_t type, const struct buffer *buf,
@@ -4200,10 +4139,6 @@ static int ssh_connect(void)
 
 	if (!sshfs.delay_connect) {
 		if (connect_remote(&sshfs.conns[0]) == -1)
-			return -1;
-
-		if (!sshfs.no_check_root &&
-		    sftp_check_root(&sshfs.conns[0], sshfs.base_path) != 0)
 			return -1;
 
 	}
