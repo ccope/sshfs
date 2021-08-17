@@ -1858,8 +1858,10 @@ static int sftp_init_reply_ok(struct conn *conn, struct buffer *buf,
 	if (buf_get_uint32(buf, &len) == -1)
 		return -1;
 
-	if (len < 5)
+	if (len < 5 || len > DEFAULT_MAX_SFTP_MSG_LIMIT) {
+		DEBUG("Invalid init packet length: %u\n", len);
 		return 1;
+	}
 
 	if (buf_get_uint8(buf, &type) == -1)
 		return -1;
