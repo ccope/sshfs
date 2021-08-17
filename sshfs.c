@@ -1823,30 +1823,30 @@ static void apply_sftp_limits(struct sftp_limits *limits) {
 }
 
 static int sftp_init_limits(struct conn *conn) {
-	int res;
+	int err;
 	struct buffer buf, outbuf;
 	struct sftp_limits limits;
 	memset(&limits, 0, sizeof(limits));
 	buf_init(&buf, 0);
 	buf_add_string(&buf, SFTP_EXT_LIMITS);
-	res = sftp_request_sync(conn, SSH_FXP_EXTENDED, &buf, SSH_FXP_EXTENDED_REPLY, &outbuf);
-	buf_free(&buf);
-	if (res != 0) {
-		return res;
+	err = sftp_request_sync(conn, SSH_FXP_EXTENDED, &buf, SSH_FXP_EXTENDED_REPLY, &outbuf);
+	if (err != 0) {
+		goto out;
 	}
-	DEBUG("Received limits reply\n", NULL);
 
-	if ((res = buf_get_uint64(&outbuf, &limits.packet_length)) != 0 ||
-	    (res = buf_get_uint64(&outbuf, &limits.read_length)) != 0 ||
-	    (res = buf_get_uint64(&outbuf, &limits.write_length)) != 0 ||
-	    (res = buf_get_uint64(&outbuf, &limits.open_handles)) != 0) {
-		buf_free(&outbuf);
-		return res;
+	if ((err = buf_get_uint64(&outbuf, &limits.packet_length)) != 0 ||
+	    (err = buf_get_uint64(&outbuf, &limits.read_length)) != 0 ||
+	    (err = buf_get_uint64(&outbuf, &limits.write_length)) != 0 ||
+	    (err = buf_get_uint64(&outbuf, &limits.open_handles)) != 0) {
+		goto out;
 	}
-	//DEBUG("Parsed limits reply:\nread: %" PRIu64 " write: %" PRIu64 "\n", &limits.read_length, &limits.write_length);
 	apply_sftp_limits(&limits);
-	return 0;
+	err = 0;
 
+out:
+	buf_free(&buf);
+	buf_free(&outbuf);
+	return err;
 }
 
 static int sftp_init_reply_ok(struct conn *conn, struct buffer *buf,
