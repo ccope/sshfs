@@ -382,6 +382,7 @@ struct sshfs {
 	int ext_statvfs;
 	int ext_hardlink;
 	int ext_fsync;
+	int ext_limits;
 	struct fuse_operations *op;
 
 	/* statistics */
@@ -1473,8 +1474,7 @@ static int sftp_request_wait_sync(struct conn *conn, struct request *req, uint8_
 
 static int sftp_error_to_errno(uint32_t error);
 
-static int sftp_request_process_sync(struct conn *conn,
-		struct request *req, uint8_t type)
+static int sftp_request_process_sync(struct conn *conn, struct request *req, uint8_t type)
 {
 	int res;
 	struct buffer buf;
@@ -1850,7 +1850,7 @@ static int sftp_init_limits(struct conn *conn) {
 }
 
 static int sftp_init_reply_ok(struct conn *conn, struct buffer *buf,
-                              uint32_t *version, uint8_t *server_limits_ext)
+                              uint32_t *version)
 {
 	uint32_t len;
 	uint8_t type;
@@ -1915,7 +1915,7 @@ static int sftp_init_reply_ok(struct conn *conn, struct buffer *buf,
 			// Query the server for its limits
 			if (strcmp(ext, SFTP_EXT_LIMITS) == 0 &&
 			    strcmp(extdata, "1") == 0) {
-				*server_limits_ext = 1;
+				sshfs.ext_limits = 1;
 			}
 			free(ext);
 			free(extdata);
@@ -1925,7 +1925,7 @@ static int sftp_init_reply_ok(struct conn *conn, struct buffer *buf,
 	return 0;
 }
 
-static int sftp_find_init_reply(struct conn *conn, uint32_t *version, uint8_t *server_limits_ext)
+static int sftp_find_init_reply(struct conn *conn, uint32_t *version)
 {
 	int res;
 	struct buffer buf;
@@ -1935,7 +1935,7 @@ static int sftp_find_init_reply(struct conn *conn, uint32_t *version, uint8_t *s
 	while (res != -1) {
 		struct buffer buf2;
 
-		res = sftp_init_reply_ok(conn, &buf, version, server_limits_ext);
+		res = sftp_init_reply_ok(conn, &buf, version);
 		if (res <= 0)
 			break;
 
@@ -1955,7 +1955,6 @@ static int sftp_init(struct conn *conn)
 {
 	int res = -1;
 	uint32_t version = 0;
-	uint8_t server_limits_ext = 0;
 	struct buffer buf;
 	buf_init(&buf, 0);
 	if (sftp_send_iov(conn, SSH_FXP_INIT, PROTO_VERSION, NULL, 0) == -1)
@@ -1964,7 +1963,7 @@ static int sftp_init(struct conn *conn)
 	if (sshfs.password_stdin && pty_expect_loop(conn) == -1)
 		goto out;
 
-	if (sftp_find_init_reply(conn, &version, &server_limits_ext) == -1)
+	if (sftp_find_init_reply(conn, &version) == -1)
 		goto out;
 
 	sshfs.server_version = version;
@@ -1974,7 +1973,7 @@ static int sftp_init(struct conn *conn)
 			version, PROTO_VERSION);
 	}
 
-	if (server_limits_ext == 1) {
+	if (sshfs.ext_limits == 1) {
 		if (sftp_init_limits(conn) != 0) {
 			fprintf(stderr, "handling server-side limits failed\n");
 			abort();
