@@ -1400,13 +1400,21 @@ static int sftp_read(struct conn *conn, uint8_t *type, struct buffer *buf)
 	buf_init(&buf2, 5);
 	res = do_read(conn, &buf2);
 	if (res != -1) {
-		if (buf_get_uint32(&buf2, &len) == -1)
-			return -1;
-		if (buf_get_uint8(&buf2, type) == -1)
-			return -1;
+		if ((res = buf_get_uint32(&buf2, &len)) == -1)
+			goto out;
+		if (len > sshfs.max_read) {
+			fprintf(stderr, "reply len too large: %u\n", len);
+			res = -1;
+			goto out;
+		}
+		if (buf_get_uint8(&buf2, type) == -1) {
+			res = -1;
+			goto out;
+		}
 		buf_init(buf, len - 1);
 		res = do_read(conn, buf);
 	}
+out:
 	buf_free(&buf2);
 	return res;
 }
